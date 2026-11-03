@@ -1,0 +1,5 @@
+[plugins."demo.clock"]
+
+[plugins."demo.reporter"]
+
+[plugins."demo.emitter"]

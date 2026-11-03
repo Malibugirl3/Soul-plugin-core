@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.11"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: conda-incubator/setup-miniconda@v4
+        with:
+          activate-environment: soul-plugin-core
+          python-version: ${{ matrix.python }}
+      - name: Install dependencies and build distributions
+        run: |
+          python -m pip install "setuptools>=77" wheel
+          python -m pip install --no-build-isolation ".[dev]"
+          python -m build --no-isolation --outdir dist
+          python -m pip install --no-deps --force-reinstall dist/*.whl
+          python -m pip check
+      - name: Verify installed package and example
+        run: |
+          python -c 'from pathlib import Path; import soul_plugin_core; assert not Path(soul_plugin_core.__file__).resolve().is_relative_to(Path.cwd().resolve())'
+          mkdir -p dist/sdist-smoke
+          tar -xzf dist/*.tar.gz -C dist/sdist-smoke
+          python -c 'from pathlib import Path; import subprocess, sys; examples = list(Path("dist/sdist-smoke").glob("*/examples/m4_demo/run_demo.py")); assert len(examples) == 1; subprocess.run([sys.executable, str(examples[0])], check=True)'
+      - name: Test
+        run: python -m pytest -q dist/sdist-smoke/*/tests
+      - name: Type check
+        run: python -m mypy
+      - name: Lint and format check
+        run: |
+          python -m ruff check .
+          python -m ruff format --check .

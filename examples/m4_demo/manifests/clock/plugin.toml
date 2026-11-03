@@ -1,0 +1,10 @@
+manifest_version = 1
+
+[plugin]
+id = "demo.clock"
+version = "1.0"
+api_version = "1"
+entry_point = "demo_plugins.clock:ClockPlugin"
+
+[provides]
+services = [{ name = "demo.clock", version = "1.0" }]

@@ -1,0 +1,10 @@
+manifest_version = 1
+
+[plugin]
+id = "probe.model"
+version = "1.0"
+api_version = "1"
+entry_point = "probe_plugins:ModelPlugin"
+
+[provides]
+services = [{ name = "probe.model", version = "1.0" }]

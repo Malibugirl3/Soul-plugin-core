@@ -1,0 +1,13 @@
+manifest_version = 1
+
+[plugin]
+id = "demo.reporter"
+version = "1.0"
+api_version = "1"
+entry_point = "demo_plugins.reporter:ReporterPlugin"
+
+[dependencies]
+services = [{ name = "demo.clock", version = ">=1,<2" }]
+
+[capabilities]
+requests = ["events.subscribe"]

@@ -1,0 +1,10 @@
+manifest_version = 1
+
+[plugin]
+id = "probe.tool"
+version = "1.0"
+api_version = "1"
+entry_point = "probe_plugins:ToolPlugin"
+
+[provides]
+services = [{ name = "probe.tool", version = "1.0" }]
