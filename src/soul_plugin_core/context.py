@@ -15,6 +15,7 @@ from soul_plugin_core.services import ServiceFacade
 
 if TYPE_CHECKING:
     from soul_plugin_core.events import EventFacade
+    from soul_plugin_core.extensions import ExtensionFacade
 
 Cleanup = Callable[[], object]
 T = TypeVar("T")
@@ -740,6 +741,7 @@ class PluginContext:
         services: ServiceFacade,
         capabilities: Iterable[str] = (),
         events: "EventFacade | None" = None,
+        extensions: "ExtensionFacade | None" = None,
     ) -> None:
         self.plugin_id = plugin_id
         self.instance_id = instance_id
@@ -748,6 +750,7 @@ class PluginContext:
         self.services = services
         self._capabilities = frozenset(capabilities)
         self._events = events
+        self._extensions = extensions
 
     @property
     def capabilities(self) -> frozenset[str]:
@@ -760,3 +763,10 @@ class PluginContext:
         if self._events is None:
             raise RuntimeError("event facade is not attached to a host")
         return self._events
+
+    @property
+    def extensions(self) -> "ExtensionFacade":
+        """与本次 Activation 绑定的观察型扩展访问门面。"""
+        if self._extensions is None:
+            raise RuntimeError("extension facade is not attached to a host")
+        return self._extensions

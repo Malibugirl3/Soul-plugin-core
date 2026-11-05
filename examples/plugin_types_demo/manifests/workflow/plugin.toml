@@ -1,0 +1,16 @@
+manifest_version = 1
+
+[plugin]
+id = "demo.workflow"
+version = "1.0"
+api_version = "1"
+entry_point = "plugin_types_example:WorkflowPlugin"
+
+[dependencies]
+services = [
+  { name = "demo.normalizer", version = ">=1,<2" },
+  { name = "core.kv", version = ">=1,<2" },
+]
+
+[provides]
+services = [{ name = "demo.workflow", version = "1.0" }]

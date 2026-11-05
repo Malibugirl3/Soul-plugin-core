@@ -6,6 +6,9 @@ A lightweight Python plugin core for composing long-running applications. It man
 plugin definitions, dependency plans, instances, services, and resource lifecycles.
 Domain behavior, such as an Agent Runtime, belongs in the application built on top.
 
+Optional typed plugin helpers, an in-memory key-value plugin, static plugin bundles,
+and an async pipeline are available for building small applications.
+
 ## Install and run the example
 
 Python 3.10 or newer is required. From a repository checkout, activate your existing
@@ -175,6 +178,78 @@ cleanup unless already claimed via `TaskHandle.aclose()`; simply awaiting
 by `activate()` for successfully stopped instances; `dispose()` is terminal. A
 `FAILED` instance is not automatically retried, and there is no public per-instance
 retry API yet.
+
+`await host.deactivate(instance_id)` explicitly disables an instance and stops its
+active strong dependents in reverse dependency order. Unrelated instances and
+shared providers remain running. `await host.activate_instance(instance_id)`
+restores only that instance when every bound provider is active; a subsequent
+`activate()` starts eligible dependents but does not re-enable explicitly disabled
+instances. Both activation methods preflight all declared instances. Use
+`is_disabled()`, `get_blockers()` (strong dependencies), and
+`get_binding_blockers()` (all bound providers) to inspect why an instance is not
+running. An active optional consumer is not stopped when its provider is disabled:
+its old handle is revoked and remains revoked after the provider returns. Restart
+the consumer to obtain a new handle. These operations retain the deployment plan;
+they do not unregister instances, rebind providers or retry `FAILED` instances.
+
+## Typed plugins and composition
+
+`soul_plugin_core.plugins.PluginProtocol` describes the existing lifecycle for
+static type checkers. `BasePlugin` supplies no-op async hooks, and
+`ServicePlugin[T]` creates and stages a single service from a subclass's
+`create_service()` method. These helpers are optional; existing plugins do not need
+to inherit them. The service name must match the plugin's Manifest, which remains
+the source of its version. Resources acquired during `create_service()` must be
+registered with `context.effects` immediately.
+
+`soul_plugin_core.builtin.memory_kv_manifest()` returns the bundled memory-store
+Manifest path without importing its plugin entry. Its `core.kv` service implements
+`KeyValueService` from `soul_plugin_core.builtin.key_value`: `put`, `get`, and
+`delete` accept strings, with `get` returning `None` for a missing key. Each plugin
+instance has its own in-memory data; it is cleared when that activation stops and
+is not persistent.
+
+`PluginBundle.from_manifests()` collects Manifest paths, and `compose_plugins()`
+returns a `CompositionPlan` with the plugin and instance plans. Its `create_host()`
+returns an ordinary unactivated Host. Configuration and capability approval still
+happen in `activate()` before plugin entries are imported; a bundle does not grant
+capabilities or own its listed instances.
+
+`AsyncPipeline[T]` runs async `T → T` steps in order. An empty pipeline returns its
+input; errors and cancellation propagate, and business side effects are not rolled
+back automatically. Service methods captured from `ServiceHandle.service` continue
+to check their leases on each call.
+
+`ServiceSelector[T]` selects between already-bound, named service handles. A default
+must be explicitly provided; a missing requested or default name raises
+`ServiceSelectionError` rather than silently choosing another implementation. It
+does not dynamically register services or bypass the static dependency plan.
+
+For observation extensions, `context.extensions.register(name, observer)` returns
+an `EffectHandle`, while `await context.extensions.invoke(name, payload)` dispatches
+to observers in registration order. Plugins must request and be granted
+`extensions.register` and/or `extensions.invoke`. Setup registrations are staged
+until start succeeds; shutdown rejects new work, drains callbacks and revokes the
+registration. Ordinary observer errors are collected in `EventDispatchError`.
+Extension names do not establish plugin dependencies: declare a plugin dependency
+when an observer must be ready before an invoker starts. Once an instance begins
+unloading, its own extension facade no longer accepts registration or invocation,
+including from its `stop()` hook.
+This channel is separate from ordinary events. It does not yet provide `around`
+wrappers, strategy replacement, or runtime plugin loading. A callback that never
+returns can delay shutdown.
+
+Run the complete example, which combines the default store with a normalizer,
+a workflow facade and a client:
+
+```powershell
+python examples/plugin_types_demo/run_demo.py
+```
+
+The example's client only depends on the workflow facade. A facade makes internal
+services unnecessary to the caller's interface; it does not create a security or
+service-namespace boundary. Per-instance unloading and dynamic rebinding are not
+included in these helpers.
 
 The host grants capabilities by instance ID. Requests in a plugin manifest are required and are denied by default:
 

@@ -1,0 +1,10 @@
+manifest_version = 1
+
+[plugin]
+id = "demo.client"
+version = "1.0"
+api_version = "1"
+entry_point = "plugin_types_example:ClientPlugin"
+
+[dependencies]
+services = [{ name = "demo.workflow", version = ">=1,<2" }]

@@ -1,0 +1,10 @@
+manifest_version = 1
+
+[plugin]
+id = "core.memory_kv"
+version = "1.0.0"
+api_version = "1"
+entry_point = "soul_plugin_core.builtin.memory_kv:MemoryKeyValuePlugin"
+
+[provides]
+services = [{ name = "core.kv", version = "1.0.0" }]

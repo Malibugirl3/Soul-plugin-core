@@ -1,7 +1,7 @@
 """宿主：按实例计划激活，并在 start 成功后提交该实例暂存的服务。"""
 
 import asyncio
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from pathlib import Path
 
 from soul_plugin_core.capabilities import CapabilityPolicy
@@ -11,9 +11,12 @@ from soul_plugin_core.contracts import PluginDefinition
 from soul_plugin_core.dependency import ActivationPlan
 from soul_plugin_core.errors import PluginActivationError, PluginCleanupError, PluginLoadError
 from soul_plugin_core.events import EventRegistry
+from soul_plugin_core.extensions import ExtensionRegistry
 from soul_plugin_core.instances import InstanceDefinition, expand_instance_plan
 from soul_plugin_core.lifecycle import Fiber, FiberState, load_plugin
 from soul_plugin_core.services import ServiceRegistry
+
+_StopOutcome = tuple[tuple[BaseException, ...], asyncio.CancelledError | None]
 
 
 class PluginHost:
@@ -38,6 +41,37 @@ class PluginHost:
         self._plan = plan
         self._instance_plan = expand_instance_plan(stored, plan, instances)
         self._plugin_ids = dict(self._instance_plan.plugin_ids)
+        # 实际绑定是固定的：强依赖决定停用级联，全部绑定决定重新启动的前置条件。
+        self._required_consumers: dict[str, set[str]] = {
+            instance_id: set() for instance_id in self._instance_plan.order
+        }
+        self._required_providers: dict[str, set[str]] = {
+            instance_id: set() for instance_id in self._instance_plan.order
+        }
+        self._bound_providers: dict[str, set[str]] = {
+            instance_id: set() for instance_id in self._instance_plan.order
+        }
+        for binding in self._instance_plan.bindings:
+            consumer = binding.consumer_instance_id
+            provider = binding.provider_instance_id
+            self._bound_providers[consumer].add(provider)
+            definition = by_id[self._plugin_ids[consumer]]
+            if binding.kind == "plugin":
+                optional = next(
+                    dep.optional
+                    for dep in definition.plugin_dependencies
+                    if dep.plugin_id == binding.target
+                )
+            else:
+                optional = next(
+                    dep.optional
+                    for dep in definition.service_dependencies
+                    if dep.name == binding.target
+                )
+            if not optional:
+                self._required_consumers[provider].add(consumer)
+                self._required_providers[consumer].add(provider)
+        self._disabled: set[str] = set()
         self._config_path = Path(config_path)
         self._fibers = {
             instance_id: Fiber(
@@ -56,57 +90,100 @@ class PluginHost:
         self._capabilities: dict[str, frozenset[str]] | None = None
         self._services = ServiceRegistry(self._definitions, self._instance_plan)
         self._events = EventRegistry()
+        self._extensions = ExtensionRegistry()
         self._lock = asyncio.Lock()
 
     def get_state(self, instance_id: str) -> FiberState:
         """返回实例的当前状态；未知实例由映射抛出 KeyError。"""
         return self._fibers[instance_id].state
 
+    def is_disabled(self, instance_id: str) -> bool:
+        """实例是否被显式停用；依赖暂不可用不等同于显式停用。"""
+        self._fibers[instance_id]
+        return instance_id in self._disabled
+
+    def get_blockers(self, instance_id: str) -> tuple[str, ...]:
+        """返回当前未 ACTIVE 的直接强依赖实例，按实例 ID 排序。"""
+        return tuple(
+            sorted(
+                provider
+                for provider in self._required_providers[instance_id]
+                if self._fibers[provider].state is not FiberState.ACTIVE
+            )
+        )
+
+    def get_binding_blockers(self, instance_id: str) -> tuple[str, ...]:
+        """返回未 ACTIVE 的已绑定 Provider，包括已绑定的可选依赖。
+
+        未绑定的可选依赖不会阻止启动；已绑定的可选依赖需要 Provider
+        恢复后才能重新 setup，现存活动消费者的旧句柄不会自动重绑。
+        """
+        return self._unavailable_bindings(instance_id)
+
+    async def deactivate(self, instance_id: str) -> None:
+        """停用实例并逆序停止其强依赖消费者；保留实例声明和绑定。
+
+        已绑定的可选消费者保持运行，其旧句柄失效且不会自动重绑。
+        此操作不注销实例，也不检测外部服务故障。
+        """
+        async with self._lock:
+            self._fibers[instance_id]  # 未知实例不改变宿主状态。
+            self._ensure_not_disposed()
+            self._disabled.add(instance_id)
+            affected = {instance_id}
+            pending = [instance_id]
+            while pending:
+                for consumer in self._required_consumers[pending.pop()]:
+                    if consumer not in affected:
+                        affected.add(consumer)
+                        pending.append(consumer)
+            await self._stop_in_reverse(affected)
+
+    async def activate_instance(self, instance_id: str) -> None:
+        """恢复一个实例；其已绑定 Provider 必须已经 ACTIVE。
+
+        不自动恢复消费者；可随后调用 activate() 按原计划启动可用实例。
+        失败时保留显式停用意图，FAILED 实例不会被自动重试。
+        """
+        async with self._lock:
+            fiber = self._fibers[instance_id]
+            self._ensure_not_disposed()
+            if fiber.state is FiberState.FAILED:
+                self._raise_failed(fiber)
+            if fiber.state is FiberState.ACTIVE:
+                self._disabled.discard(instance_id)
+                return
+            unavailable = self._unavailable_bindings(instance_id)
+            if unavailable:
+                raise PluginActivationError(
+                    "bound provider is not active: " + ", ".join(unavailable),
+                    plugin_id=fiber.plugin_id,
+                    instance_id=instance_id,
+                    phase="activate",
+                    source=fiber.source,
+                )
+            self._preflight()
+            await self._activate_fiber(fiber)
+            self._disabled.discard(instance_id)
+
     async def activate(self) -> None:
         """按依赖顺序激活；失败或取消时逆序回滚本次新激活的实例。"""
         async with self._lock:
-            if any(fiber.state is FiberState.DISPOSED for fiber in self._fibers.values()):
-                raise PluginActivationError(
-                    "disposed host cannot be activated",
-                    plugin_id=None,
-                    instance_id=None,
-                    phase="activate",
-                    source=str(self._config_path),
-                )
-            configs = validate_deployment(
-                {
-                    instance_id: self._definitions[self._plugin_ids[instance_id]]
-                    for instance_id in self._instance_plan.order
-                },
-                self._config_path,
-            )
-            capabilities = {
-                instance_id: self._capability_policy.authorize(
-                    instance_id,
-                    self._definitions[self._plugin_ids[instance_id]],
-                )
-                for instance_id in self._instance_plan.order
-            }
-            self._configs = configs
-            self._capabilities = capabilities
+            self._ensure_not_disposed()
+            self._preflight()
             activated: list[Fiber] = []
             try:
                 for instance_id in self._instance_plan.order:
                     fiber = self._fibers[instance_id]
-                    if fiber.state is FiberState.ACTIVE:
+                    if fiber.state is FiberState.ACTIVE or instance_id in self._disabled:
                         continue
                     if fiber.state is FiberState.FAILED:
-                        raise PluginActivationError(
-                            "failed instance requires an explicit retry",
-                            plugin_id=fiber.plugin_id,
-                            instance_id=fiber.instance_id,
-                            phase="activate",
-                            source=fiber.source,
-                        )
+                        self._raise_failed(fiber)
+                    if self._unavailable_bindings(instance_id):
+                        continue
                     await self._activate_fiber(fiber)
                     activated.append(fiber)
             except asyncio.CancelledError:
-                # 当前 Fiber 已在 _activate_fiber 收口。这里只回滚本次新激活的前置插件。
                 await self._rollback(activated)
                 raise
             except Exception as exc:
@@ -114,6 +191,53 @@ class PluginHost:
                 if isinstance(exc, (PluginLoadError, PluginActivationError)):
                     self._append_rollback(exc, extra)
                 raise
+
+    def _ensure_not_disposed(self) -> None:
+        if any(fiber.state is FiberState.DISPOSED for fiber in self._fibers.values()):
+            raise PluginActivationError(
+                "disposed host cannot be activated",
+                plugin_id=None,
+                instance_id=None,
+                phase="activate",
+                source=str(self._config_path),
+            )
+
+    @staticmethod
+    def _raise_failed(fiber: Fiber) -> None:
+        raise PluginActivationError(
+            "failed instance requires an explicit retry",
+            plugin_id=fiber.plugin_id,
+            instance_id=fiber.instance_id,
+            phase="activate",
+            source=fiber.source,
+        )
+
+    def _unavailable_bindings(self, instance_id: str) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                provider
+                for provider in self._bound_providers[instance_id]
+                if self._fibers[provider].state is not FiberState.ACTIVE
+            )
+        )
+
+    def _preflight(self) -> None:
+        configs = validate_deployment(
+            {
+                instance_id: self._definitions[self._plugin_ids[instance_id]]
+                for instance_id in self._instance_plan.order
+            },
+            self._config_path,
+        )
+        capabilities = {
+            instance_id: self._capability_policy.authorize(
+                instance_id,
+                self._definitions[self._plugin_ids[instance_id]],
+            )
+            for instance_id in self._instance_plan.order
+        }
+        self._configs = configs
+        self._capabilities = capabilities
 
     async def stop(self) -> None:
         """逆序停止活动实例并清理资源；成功停止的实例可再次激活。"""
@@ -170,6 +294,13 @@ class PluginHost:
                     scope,
                     capabilities[fiber.instance_id],
                 ),
+                self._extensions.open_activation(
+                    fiber.plugin_id,
+                    fiber.instance_id,
+                    fiber.source,
+                    scope,
+                    capabilities[fiber.instance_id],
+                ),
             )
             try:
                 setup_result = await instance.setup(context, config)
@@ -196,6 +327,7 @@ class PluginHost:
                 )
             self._services.commit(fiber.plugin_id, fiber.instance_id, fiber.source)
             self._events.commit(fiber.instance_id)
+            self._extensions.commit(fiber.instance_id)
         except asyncio.CancelledError as exc:
             # 取消继续向上冒泡，但已登记的资源先按这个取消异常收口。
             await self._fail(fiber, exc)
@@ -230,7 +362,10 @@ class PluginHost:
             if fiber.setup_completed:
                 errors, _cancel = await self._stop_fiber(fiber, FiberState.FAILED, cause)
             else:
+                self._events.begin_drain(fiber.instance_id)
+                self._extensions.begin_drain(fiber.instance_id)
                 await self._drain_events(fiber.instance_id)
+                await self._drain_extensions(fiber.instance_id)
                 errors, _cancel = await self._close_scope(fiber, cause)
         finally:
             leftover = fiber.scope
@@ -246,6 +381,7 @@ class PluginHost:
                 # setup 未完成时没有走过 _stop_fiber。Scope 清理后再撤销 generation。
                 # open_setup 之前的加载失败会在这里安全空返回。
                 self._events.revoke(fiber.instance_id)
+                self._extensions.revoke(fiber.instance_id)
                 self._services.revoke(fiber.instance_id)
         return errors
 
@@ -273,10 +409,12 @@ class PluginHost:
             fiber.setup_completed = False
             fiber.state = FiberState.DISPOSED
 
-    async def _stop_in_reverse(self) -> None:
+    async def _stop_in_reverse(self, selected: set[str] | None = None) -> None:
         collected: list[BaseException] = []
         cancel: asyncio.CancelledError | None = None
         for instance_id in reversed(self._instance_plan.order):
+            if selected is not None and instance_id not in selected:
+                continue
             fiber = self._fibers[instance_id]
             if fiber.state is not FiberState.ACTIVE:
                 continue
@@ -308,31 +446,23 @@ class PluginHost:
         try:
             # 在等待任何一类在途工作前，先同步关闭事件和服务的新入口。
             self._events.begin_drain(fiber.instance_id)
+            self._extensions.begin_drain(fiber.instance_id)
             self._services.begin_drain(fiber.instance_id)
             cancel = await self._drain_events(fiber.instance_id)
+            extension_cancel = await self._drain_extensions(fiber.instance_id)
+            if cancel is None:
+                cancel = extension_cancel
             # 在途调用结束时只唤醒自己的 Future，不能再来获取这把生命周期锁。
-            await self._services.drain(fiber.instance_id)
-            if fiber.setup_completed and fiber.instance is not None:
-                try:
-                    result = await fiber.instance.stop()
-                    if result is not None:
-                        errors.append(
-                            PluginActivationError(
-                                "stop must return None",
-                                plugin_id=fiber.plugin_id,
-                                instance_id=fiber.instance_id,
-                                phase="stop",
-                                source=fiber.source,
-                            )
-                        )
-                except Exception as exc:  # noqa: BLE001 - 停止失败仍继续清理
-                    errors.append(exc)
-            closed, scope_cancel = await self._close_scope(fiber, cause)
+            service_cancel = await self._drain_services(fiber.instance_id)
+            if cancel is None:
+                cancel = service_cancel
+            closed, stop_cancel = await self._stop_and_close(fiber, cause)
             errors.extend(closed)
             if cancel is None:
-                cancel = scope_cancel
+                cancel = stop_cancel
         finally:
             self._events.revoke(fiber.instance_id)
+            self._extensions.revoke(fiber.instance_id)
             self._services.revoke(fiber.instance_id)
             leftover = fiber.scope
             fiber.instance = None
@@ -351,23 +481,103 @@ class PluginHost:
 
     async def _drain_events(self, instance_id: str) -> asyncio.CancelledError | None:
         """取消等待不丢弃已开始的回调；排空后由宿主继续清理并传播取消。"""
+        return await self._drain_with_cancellation(self._events.drain, instance_id)
+
+    async def _drain_extensions(self, instance_id: str) -> asyncio.CancelledError | None:
+        """等待已进入的观察回调，不让外部取消中断生命周期收口。"""
+        return await self._drain_with_cancellation(self._extensions.drain, instance_id)
+
+    async def _drain_services(self, instance_id: str) -> asyncio.CancelledError | None:
+        """取消等待不提前撤销在途服务；调用结束后继续停止并传播取消。"""
+        return await self._drain_with_cancellation(self._services.drain, instance_id)
+
+    @staticmethod
+    async def _drain_with_cancellation(
+        drain: Callable[[str], Awaitable[None]], instance_id: str
+    ) -> asyncio.CancelledError | None:
         cancelled: asyncio.CancelledError | None = None
         while True:
             try:
-                await self._events.drain(instance_id)
+                await drain(instance_id)
             except asyncio.CancelledError as exc:
                 if cancelled is None:
                     cancelled = exc
             else:
                 return cancelled
 
+    async def _stop_and_close(
+        self, fiber: Fiber, cause: BaseException | None
+    ) -> tuple[tuple[BaseException, ...], asyncio.CancelledError | None]:
+        """调用方取消只中断等待；停止钩子和资源关闭仍在同一任务里收口。"""
+        completed: list[_StopOutcome] = []
+        pending = asyncio.create_task(self._run_stop_and_scope(fiber, cause, completed))
+        cancelled: asyncio.CancelledError | None = None
+        while True:
+            try:
+                errors, inner_cancel = await asyncio.shield(pending)
+            except asyncio.CancelledError as exc:
+                if pending.cancelled():
+                    try:
+                        pending.result()
+                    except asyncio.CancelledError as stop_cancel:
+                        # stop() 可能自行取消当前 Task 后同步返回；即便 Task
+                        # 最终呈取消状态，同步清理已保存的错误也不能丢失。
+                        errors = completed[0][0] if completed else ()
+                        return errors, cancelled if cancelled is not None else stop_cancel
+                if cancelled is None:
+                    cancelled = exc
+                if pending.done():
+                    errors, _inner_cancel = pending.result()
+                    return errors, cancelled
+            else:
+                return errors, cancelled if cancelled is not None else inner_cancel
+
+    async def _run_stop_and_scope(
+        self, fiber: Fiber, cause: BaseException | None, completed: list[_StopOutcome]
+    ) -> _StopOutcome:
+        """stop 返回后立即关闭 Scope，让同步租约释放不被额外调度延迟。"""
+        errors: list[BaseException] = []
+        cancelled: asyncio.CancelledError | None = None
+        if fiber.setup_completed and fiber.instance is not None:
+            try:
+                result = await fiber.instance.stop()
+                if result is not None:
+                    errors.append(
+                        PluginActivationError(
+                            "stop must return None",
+                            plugin_id=fiber.plugin_id,
+                            instance_id=fiber.instance_id,
+                            phase="stop",
+                            source=fiber.source,
+                        )
+                    )
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+            except Exception as exc:  # noqa: BLE001 - 停止失败仍继续清理
+                errors.append(exc)
+        closed, scope_cancel = await self._close_scope(fiber, cause)
+        errors.extend(closed)
+        if cancelled is None:
+            cancelled = scope_cancel
+        outcome = (tuple(errors), cancelled)
+        completed.append(outcome)
+        return outcome
+
     async def _close_scope(
         self,
         fiber: Fiber,
         cause: BaseException | None = None,
     ) -> tuple[tuple[BaseException, ...], asyncio.CancelledError | None]:
-        if fiber.scope is None:
+        scope = fiber.scope
+        if scope is None:
             return (), None
-        result = await fiber.scope._finish(cause)
-        fiber.scope = None
-        return result
+        cancelled: asyncio.CancelledError | None = None
+        while True:
+            try:
+                errors, scope_cancel = await scope._finish(cause)
+            except asyncio.CancelledError as exc:
+                if cancelled is None:
+                    cancelled = exc
+            else:
+                fiber.scope = None
+                return errors, cancelled if cancelled is not None else scope_cancel

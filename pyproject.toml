@@ -42,6 +42,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 soul_plugin_core = ["py.typed"]
+"soul_plugin_core.builtin" = ["*.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -55,21 +56,33 @@ target-version = "py310"
 python_version = "3.10"
 files = [
     "examples/m4_demo",
+    "examples/plugin_types_demo",
     "examples/soulrt_probe",
     "src/soul_plugin_core/capabilities.py",
+    "src/soul_plugin_core/builtin",
     "src/soul_plugin_core/config.py",
+    "src/soul_plugin_core/composition.py",
     "src/soul_plugin_core/context.py",
     "src/soul_plugin_core/dependency.py",
     "src/soul_plugin_core/errors.py",
     "src/soul_plugin_core/events.py",
+    "src/soul_plugin_core/extensions.py",
     "src/soul_plugin_core/host.py",
     "src/soul_plugin_core/instances.py",
     "src/soul_plugin_core/lifecycle.py",
+    "src/soul_plugin_core/plugins.py",
+    "src/soul_plugin_core/pipeline.py",
     "src/soul_plugin_core/services.py",
+    "src/soul_plugin_core/selection.py",
     "tests/typecheck_m3a_handle.py",
+    "tests/typecheck_builtin_kv.py",
+    "tests/typecheck_composition.py",
+    "tests/typecheck_extensions.py",
     "tests/typecheck_m3b_effects.py",
     "tests/typecheck_m3c_capabilities.py",
     "tests/typecheck_m4a_events.py",
+    "tests/typecheck_plugin_types.py",
+    "tests/typecheck_service_selection.py",
 ]
 check_untyped_defs = true
 disallow_untyped_defs = true

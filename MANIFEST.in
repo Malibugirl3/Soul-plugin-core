@@ -1,4 +1,5 @@
 recursive-include examples/m4_demo *.py *.toml
+recursive-include examples/plugin_types_demo *.py *.toml
 recursive-include examples/soulrt_probe *.py *.toml *.md
 recursive-include tests *.py
 include README.zh-CN.md

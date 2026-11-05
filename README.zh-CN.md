@@ -6,6 +6,8 @@ Soul Plugin Core 是一个 Python 插件核心，负责插件声明、依赖计�
 
 项目目前处于早期开发阶段，公开 API 尚不稳定。
 
+Core 还提供可选的类型化插件辅助、内存键值默认插件、静态插件集合和异步顺序调用链，方便构建小型应用。
+
 ## 安装与运行示例
 
 需要 Python 3.10 或更新版本。在项目目录中使用已有的 Conda 环境：
@@ -126,6 +128,10 @@ schema = "config.schema.json"
 
 `PluginHost.get_state(instance_id)` 可以读取实例状态。入口类及服务通过各自模块导入；包根当前只导出 `__version__`。
 
+`await host.deactivate(instance_id)` 显式停用实例，并按依赖逆序停止仍在运行的强依赖消费者；无关实例和共享 Provider 不受影响。所有声明和绑定都会保留。`await host.activate_instance(instance_id)` 在全部已绑定 Provider 均为 ACTIVE 时只恢复该实例；之后调用 `activate()` 可以启动满足条件的消费者，但不会自动恢复显式停用的实例。两种激活方式都预检全部声明实例，`FAILED` 实例不能通过此接口重试。
+
+可以通过 `is_disabled()` 查询显式停用意图，`get_blockers()` 查询未运行的强依赖，`get_binding_blockers()` 查询全部未运行的已绑定 Provider。已绑定的 Optional 消费者在 Provider 停用时继续运行，但旧服务句柄失效；Provider 恢复后仍需重启消费者才能获得新句柄。目前不支持注销实例或动态重绑。
+
 ## 服务、资源与事件
 
 服务提供者在 Manifest 中声明服务，并在 `setup()` 中调用 `context.services.provide()` 暂存实现；`start()` 成功后宿主才提交服务。消费者也在 `setup()` 中获取服务：`require()` 用于强依赖，`optional()` 用于可选依赖；只有可选依赖在计划中未绑定时才返回 `None`。
@@ -137,6 +143,43 @@ schema = "config.schema.json"
 事件通过 `context.events.subscribe()` 和 `publish()` 使用，插件必须在 Manifest 中申请对应的 `events.subscribe` 或 `events.publish`，并由宿主按实例 ID 授权。事件在进程内串行派发且不持久化；监听器错误会汇总为 `EventDispatchError`。事件和服务采用协作式排空，永不返回的调用可能使停止一直等待。
 
 能力授权是应用层的声明和审计，并不是操作系统沙箱；进程内 Python 插件仍然可以直接调用系统 API。目前也没有受该策略控制的网络、文件或日志适配器。
+
+## 插件类型与组合
+
+`soul_plugin_core.plugins.PluginProtocol` 描述生命周期类型；`BasePlugin` 提供无操作的异步默认钩子；`ServicePlugin[T]` 在子类的 `create_service()` 中创建并暂存一个服务。这些辅助类都可以按需使用，现有插件不需要继承。服务名必须与 Manifest 声明一致，服务版本仍由 Manifest 决定；`create_service()` 取得资源后应立即登记清理。
+
+`soul_plugin_core.builtin.memory_kv_manifest()` 返回内存键值插件的 Manifest 路径，不会导入插件入口。它提供 `core.kv` 服务，接口为 `soul_plugin_core.builtin.key_value.KeyValueService`，包含 `put`、`get`、`delete`；键和值均为字符串，缺失时 `get` 返回 `None`。每个插件实例的数据独立，停止该次激活时清空，数据不持久化。
+
+`PluginBundle.from_manifests()` 收集 Manifest 路径；`compose_plugins()` 返回包含插件计划和实例计划的 `CompositionPlan`；`create_host()` 创建普通的未激活 Host。配置和授权仍在 `activate()` 中、导入插件入口前预检。插件集合不会自动授予权限，也不自动拥有其中的插件实例。
+
+`AsyncPipeline[T]` 按顺序执行同类型的异步步骤。空调用链返回输入；异常和取消继续向上传播，不自动回滚业务副作用。通过 `ServiceHandle.service` 取得的方法每次调用仍会检查租约。
+
+`ServiceSelector[T]` 可以在已经绑定的多个具名服务句柄之间选择策略或后端。默认项必须显式指定；请求的名称或默认项不存在时抛出 `ServiceSelectionError`，不会静默回退。它不负责动态注册服务，也不绕过静态依赖计划。
+
+例如，两个策略分别以 `policy.first` 和 `policy.last` 声明服务，消费者在 `setup()` 中取得句柄并创建选择器：
+
+```python
+from soul_plugin_core.selection import ServiceSelector
+
+# Policy 是应用自行定义的服务 Protocol。
+first = context.services.require("policy.first", Policy)
+last = context.services.require("policy.last", Policy)
+selector = ServiceSelector({"first": first, "last": last}, default="first")
+```
+
+之后调用 `selector.select("last").service` 上的方法即可。两个 Provider 必须使用不同的服务名，且消费者的 Manifest 必须声明对应依赖。
+
+观察型扩展通过 `context.extensions.register(name, observer)` 登记，通过 `await context.extensions.invoke(name, payload)` 按登记顺序调用；插件需要分别申请并获得 `extensions.register`、`extensions.invoke` 能力。setup 阶段的登记会等到插件启动成功后才生效，停止时先拒绝新调用、等待在途回调，再撤销登记。普通观察者异常汇总为 `EventDispatchError`。扩展通道与普通事件相互独立；目前不提供 `around` 包装、策略替换或运行中加载插件，不返回的回调可能使停止持续等待。
+
+扩展点名称本身不建立插件依赖。如果调用方启动时必须已有观察者，应声明插件依赖以确定启动顺序。实例进入卸载状态后，其自身扩展门面不再接受登记或调用，`stop()` 中也不能使用该门面。
+
+完整示例将默认键值插件、文本处理插件、工作流门面和消费者组合起来：
+
+```powershell
+python examples/plugin_types_demo/run_demo.py
+```
+
+示例的消费者只依赖门面服务。门面减少调用方对内部组织的了解，但不构成安全隔离或服务命名空间隔离。单实例在线卸载和动态重绑定尚未包含在这些辅助工具中。
 
 ## SoulRT 接入验证
 

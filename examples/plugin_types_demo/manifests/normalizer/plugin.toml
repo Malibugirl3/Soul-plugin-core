@@ -1,0 +1,10 @@
+manifest_version = 1
+
+[plugin]
+id = "demo.normalizer"
+version = "1.0"
+api_version = "1"
+entry_point = "plugin_types_example:NormalizerPlugin"
+
+[provides]
+services = [{ name = "demo.normalizer", version = "1.0" }]
