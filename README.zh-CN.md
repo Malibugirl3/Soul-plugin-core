@@ -202,6 +202,10 @@ python -m pytest tests/test_soulrt_integration_probe.py tests/test_soulrt_stream
 
 ## 开发检查
 
+开发使用短期 `codex/...` 分支，通过 PR 和 CI 后再合并到 `main`。
+`main` 保存集成基线，版本标签标记正式发布；具体步骤见
+[贡献与发布流程](CONTRIBUTING.md)。
+
 ```powershell
 python -m pytest
 python -m mypy
