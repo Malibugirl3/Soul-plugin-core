@@ -332,6 +332,10 @@ The probe keeps each stream inside an async service call using a callback. The c
 
 ## Development
 
+Use a short-lived `codex/...` branch and merge through a pull request after CI passes.
+`main` is the integration baseline; version tags mark releases. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the branch, testing, and release workflow.
+
 ```powershell
 python -m pytest
 python -m ruff check .
