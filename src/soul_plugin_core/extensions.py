@@ -69,6 +69,10 @@ class ExtensionRegistry:
     def commit(self, instance_id: str) -> None:
         self._channel.commit(instance_id)
 
+    def active_instance_ids(self) -> frozenset[str]:
+        """当前扩展调用链中仍在途的调用者及观察者。"""
+        return self._channel.active_instance_ids()
+
     def begin_drain(self, instance_id: str) -> None:
         self._channel.begin_drain(instance_id)
 

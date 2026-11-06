@@ -131,6 +131,8 @@ validated before any plugin entry is imported. A plugin without `[config]` `sche
 accepts only an empty table. A declared schema is a JSON Schema Draft 2020-12 file
 inside the manifest directory; configuration is recursively read-only after
 validation, with lists exposed as tuples.
+Schema references are limited to the same document; external file and network
+retrieval are rejected. Configuration error diagnostics do not include values.
 
 For example, to accept a `name` value, add this to the plugin manifest:
 
@@ -191,6 +193,21 @@ running. An active optional consumer is not stopped when its provider is disable
 its old handle is revoked and remains revoked after the provider returns. Restart
 the consumer to obtain a new handle. These operations retain the deployment plan;
 they do not unregister instances, rebind providers or retry `FAILED` instances.
+
+`host.instance_plan` exposes the immutable instance plan. `host.snapshot()`
+returns immutable per-instance status, disabled flags, and provider blockers in
+plan order without configuration values or plugin objects. It is a synchronous
+event-loop snapshot, not a cross-thread consistency guarantee. An active optional
+consumer can have `binding_blockers` even though it remains running.
+
+Do not await operations on the same Host from lifecycle hooks, or await a stop
+that would drain the current service call, event or extension callback. Detected
+reentry is rejected to prevent circular waits. Tasks spawned by an active call
+inherit this restriction until that call completes; arrange for the host to stop
+after the call returns.
+Managed tasks and cleanup callbacks follow the same restriction. Arbitrary
+indirect waits through externally created tasks or futures cannot all be detected;
+request shutdown from an outer host task that the instance's cleanup is not waiting on.
 
 ## Typed plugins and composition
 

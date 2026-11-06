@@ -1,7 +1,11 @@
 """服务暂存、提交、Handle，以及 generation 的租约和排空。"""
 
+from __future__ import annotations
+
 import asyncio
+import contextvars
 import inspect
+import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Generic, NoReturn, Protocol, TypeVar, cast
@@ -13,13 +17,28 @@ from soul_plugin_core.errors import PluginActivationError, ServiceUnavailableErr
 from soul_plugin_core.instances import InstanceActivationPlan
 
 T = TypeVar("T")
+_REVOKED_IMPLEMENTATION = object()
+
+
+@dataclass
+class _CallFrame:
+    """共享活动标记，避免子任务继承的已结束调用上下文产生误报。"""
+
+    registry: weakref.ReferenceType[ServiceRegistry]
+    provider_id: str
+    active: bool = True
+
+
+_call_frames: contextvars.ContextVar[tuple[_CallFrame, ...]] = contextvars.ContextVar(
+    "soul_plugin_core_service_calls", default=()
+)
 
 
 class _Scope(Protocol):
     def defer(self, cleanup: Callable[[], object], label: str | None = None) -> object: ...
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Registration:
     name: str
     implementation: object
@@ -57,30 +76,36 @@ class _Lease:
 
 
 class _CallGate:
-    def __init__(self, registry: "ServiceRegistry", lease: _Lease) -> None:
+    def __init__(self, registry: ServiceRegistry, lease: _Lease) -> None:
         self._registry = registry
         self._lease = lease
 
-    def enter(self) -> None:
+    def enter(self) -> tuple[contextvars.Token[tuple[_CallFrame, ...]], _CallFrame]:
         self._registry.enter_call(self._lease)
+        frame = _CallFrame(
+            weakref.ref(self._registry), self._lease.registration.provider_instance_id
+        )
+        return _call_frames.set((*_call_frames.get(), frame)), frame
 
-    def leave(self) -> None:
+    def leave(self, token: contextvars.Token[tuple[_CallFrame, ...]], frame: _CallFrame) -> None:
+        frame.active = False
+        _call_frames.reset(token)
         self._registry.leave_call(self._lease)
 
 
 class _ServiceProxy:
     """只转发 interface 声明的异步方法。实现对象不作为代理属性暴露。"""
 
-    __slots__ = ("_gate", "_implementation", "_interface")
+    __slots__ = ("_gate", "_interface", "_registration")
 
-    def __init__(self, implementation: object, interface: object, gate: _CallGate) -> None:
-        object.__setattr__(self, "_implementation", implementation)
+    def __init__(self, registration: _Registration, interface: object, gate: _CallGate) -> None:
+        object.__setattr__(self, "_registration", registration)
         object.__setattr__(self, "_interface", interface)
         object.__setattr__(self, "_gate", gate)
 
     def __getattribute__(self, name: str) -> object:
         # 槽位里的实现对象和调用门不能被读出来；其余缺失属性交给 __getattr__。
-        if name in {"_gate", "_implementation", "_interface"}:
+        if name in {"_gate", "_registration", "_interface"}:
             raise AttributeError(name)
         return object.__getattribute__(self, name)
 
@@ -92,26 +117,32 @@ class _ServiceProxy:
 
     def __getattr__(self, name: str) -> Callable[..., Awaitable[object]]:
         interface = object.__getattribute__(self, "_interface")
-        implementation = object.__getattribute__(self, "_implementation")
+        registration = cast(_Registration, object.__getattribute__(self, "_registration"))
+        implementation = registration.implementation
         declared = inspect.getattr_static(interface, name, None)
         if not inspect.iscoroutinefunction(declared):
             raise AttributeError(name)
         # 先看静态成员。property 和自定义 __getattr__ 都不能在这里被执行。
-        static_target = inspect.getattr_static(implementation, name, None)
-        if not inspect.iscoroutinefunction(static_target):
-            raise AttributeError(name)
-        target = getattr(implementation, name)
-        if not inspect.iscoroutinefunction(target):
-            raise AttributeError(name)
-        method = cast(Callable[..., Awaitable[object]], target)
+        if implementation is not _REVOKED_IMPLEMENTATION:
+            static_target = inspect.getattr_static(implementation, name, None)
+            if not inspect.iscoroutinefunction(static_target):
+                raise AttributeError(name)
         gate = cast(_CallGate, object.__getattribute__(self, "_gate"))
 
         async def invoke(*args: object, **kwargs: object) -> object:
-            gate.enter()
+            token, frame = gate.enter()
             try:
+                # 只在调用进入后绑定方法；缓存的代理方法不持有旧实现。
+                current = registration.implementation
+                static_method = inspect.getattr_static(current, name, None)
+                if not inspect.iscoroutinefunction(static_method):
+                    raise AttributeError(name)
+                method = getattr(current, name)
+                if not inspect.iscoroutinefunction(method):
+                    raise AttributeError(name)
                 return await method(*args, **kwargs)
             finally:
-                gate.leave()
+                gate.leave(token, frame)
 
         return invoke
 
@@ -129,7 +160,7 @@ class ServiceHandle(Generic[T]):
         gate: _CallGate,
     ) -> None:
         self._registration = registration
-        self._service = cast(T, _ServiceProxy(registration.implementation, interface, gate))
+        self._service = cast(T, _ServiceProxy(registration, interface, gate))
 
     @property
     def name(self) -> str:
@@ -185,7 +216,7 @@ class ServiceRegistry:
         instance_id: str,
         source: str,
         scope: _Scope,
-    ) -> "ServiceFacade":
+    ) -> ServiceFacade:
         """进入 setup。generation 在离开 PENDING 后的每次新激活上递增。"""
         for lease in self._consumer_leases.pop(instance_id, []):
             lease.released = True
@@ -266,7 +297,9 @@ class ServiceRegistry:
             if key[0] == instance_id and registration.generation == state.generation
         ]
         for key in stale:
-            del self._available[key]
+            registration = self._available.pop(key)
+            # 已排空的 generation 仅保留身份信息，不再持有服务实现。
+            registration.implementation = _REVOKED_IMPLEMENTATION
         self._states.pop((instance_id, state.generation), None)
         if self._current.get(instance_id) is state:
             del self._current[instance_id]
@@ -274,6 +307,14 @@ class ServiceRegistry:
     def accepts(self, registration: _Registration) -> bool:
         state = self._states.get((registration.provider_instance_id, registration.generation))
         return state is not None and state.accepting and not state.revoked
+
+    def active_provider_ids(self) -> frozenset[str]:
+        """当前调用链中仍在执行的本 Registry Provider，供宿主检测停用重入。"""
+        return frozenset(
+            frame.provider_id
+            for frame in _call_frames.get()
+            if frame.active and frame.registry() is self
+        )
 
     def bind(self, consumer_id: str, registration: _Registration) -> _Lease:
         state = self._states[(registration.provider_instance_id, registration.generation)]

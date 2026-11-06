@@ -8,6 +8,8 @@ from types import MappingProxyType
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
+from referencing import Registry
+from referencing.exceptions import Unresolvable
 
 from soul_plugin_core.contracts import PluginDefinition
 from soul_plugin_core.errors import ConfigValidationError
@@ -77,7 +79,13 @@ def _read_config(config_path: Path) -> dict[str, object]:
             config_path=source,
             cause=exc,
         ) from exc
-    except UnicodeDecodeError as exc:
+    except UnicodeDecodeError:
+        # Decode errors retain the original input bytes. Do not expose them through
+        # cause, context, or a formatted traceback.
+        invalid_encoding = True
+    else:
+        invalid_encoding = False
+    if invalid_encoding:
         raise ConfigValidationError(
             "deployment configuration is not valid UTF-8",
             plugin_id=None,
@@ -85,11 +93,15 @@ def _read_config(config_path: Path) -> dict[str, object]:
             phase=_PHASE,
             source=source,
             config_path=source,
-            cause=exc,
-        ) from exc
+        )
     try:
         document = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
+    except tomllib.TOMLDecodeError:
+        # TOML parser exceptions may retain the complete input document.
+        invalid_toml = True
+    else:
+        invalid_toml = False
+    if invalid_toml:
         raise ConfigValidationError(
             "deployment configuration is not valid TOML",
             plugin_id=None,
@@ -97,8 +109,7 @@ def _read_config(config_path: Path) -> dict[str, object]:
             phase=_PHASE,
             source=source,
             config_path=source,
-            cause=exc,
-        ) from exc
+        )
     if not isinstance(document, dict):
         raise ConfigValidationError(
             "deployment configuration must be a table",
@@ -264,7 +275,9 @@ def _load_schema(
             schema_path=str(schema_path),
         )
     declared = schema.get("$schema")
-    if declared is not None and declared not in _SUPPORTED_SCHEMAS:
+    if declared is not None and (
+        not isinstance(declared, str) or declared not in _SUPPORTED_SCHEMAS
+    ):
         raise ConfigValidationError(
             "schema draft is not supported",
             plugin_id=definition.plugin_id,
@@ -299,12 +312,22 @@ def _validate_instance(
     schema_path: Path,
     config_source: str,
 ) -> None:
+    # An empty registry permits same-document references, but never retrieves
+    # external documents implicitly (including HTTP and filesystem URLs).
+    error_message: str | None = None
+    pointer = ""
     try:
-        Draft202012Validator(schema).validate(config)
+        Draft202012Validator(schema, registry=Registry()).validate(config)
     except ValidationError as exc:
         pointer = "/" + "/".join(str(part) for part in exc.absolute_path)
+        error_message = "configuration does not match schema"
+    except Unresolvable:
+        error_message = "schema reference cannot be resolved"
+    if error_message is not None:
+        # Raise after the except block: ValidationError retains the entire input
+        # instance, even if an exception chain is suppressed with ``from None``.
         raise ConfigValidationError(
-            "configuration does not match schema",
+            error_message,
             plugin_id=definition.plugin_id,
             instance_id=instance_id,
             phase=_PHASE,
@@ -312,8 +335,7 @@ def _validate_instance(
             config_path=config_source,
             schema_path=str(schema_path),
             json_path=pointer,
-            cause=exc,
-        ) from exc
+        )
 
 
 def _freeze(value: object) -> object:

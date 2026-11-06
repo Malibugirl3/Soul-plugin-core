@@ -1,14 +1,19 @@
 """插件上下文：身份、只读配置、可单独关闭的 defer，以及 setup 期间的服务门面。"""
 
+from __future__ import annotations
+
 import asyncio
+import contextvars
 import inspect
 import sys
-from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, auto
 from inspect import isawaitable
 from types import FunctionType, TracebackType
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar, cast
-from weakref import WeakSet, ref
+from weakref import ReferenceType, WeakKeyDictionary, WeakSet, ref
 
 from soul_plugin_core.errors import PluginActivationError, PluginCleanupError
 from soul_plugin_core.services import ServiceFacade
@@ -21,6 +26,87 @@ Cleanup = Callable[[], object]
 T = TypeVar("T")
 _T_co = TypeVar("_T_co", covariant=True)
 _ExitArgs = tuple[type[BaseException] | None, BaseException | None, TracebackType | None]
+
+
+@dataclass
+class _TaskFrame:
+    """A task's inherited ownership marker; neither scope nor task is kept alive."""
+
+    scope: ReferenceType[ActivationScope]
+    task: ReferenceType[asyncio.Task[object]] | None = None
+
+    def live(self) -> bool:
+        if self.task is None:
+            # A custom eager task factory may execute before create_task returns.
+            return True
+        task = self.task()
+        return task is not None and not task.done()
+
+
+_task_frames: contextvars.ContextVar[tuple[_TaskFrame, ...]] = contextvars.ContextVar(
+    "soul_plugin_core_managed_tasks", default=()
+)
+
+
+def active_managed_scopes() -> tuple[ActivationScope, ...]:
+    """Return still-live managed task owners inherited by the current call chain."""
+    scopes: list[ActivationScope] = []
+    for frame in _task_frames.get():
+        if frame.live() and (scope := frame.scope()) is not None:
+            scopes.append(scope)
+    return tuple(scopes)
+
+
+@dataclass
+class _CleanupFrame:
+    scope: ReferenceType[ActivationScope]
+    effect: ReferenceType[_Effect]
+    active: bool = True
+
+
+_cleanup_frames: contextvars.ContextVar[tuple[_CleanupFrame, ...]] = contextvars.ContextVar(
+    "soul_plugin_core_cleanup_calls", default=()
+)
+_awaited_cleanup_tasks: WeakKeyDictionary[asyncio.Task[object], list[_CleanupFrame]] = (
+    WeakKeyDictionary()
+)
+
+
+def _track_cleanup_task(result: object, frame: _CleanupFrame | None) -> None:
+    if frame is not None and isinstance(result, asyncio.Task):
+        tracked = cast(asyncio.Task[object], result)
+        _awaited_cleanup_tasks.setdefault(tracked, []).append(frame)
+
+
+def _untrack_cleanup_task(result: object, frame: _CleanupFrame | None) -> None:
+    if frame is None or not isinstance(result, asyncio.Task):
+        return
+    tracked = cast(asyncio.Task[object], result)
+    frames = _awaited_cleanup_tasks.get(tracked)
+    if frames is None:
+        return
+    remaining = [item for item in frames if item is not frame]
+    if remaining:
+        _awaited_cleanup_tasks[tracked] = remaining
+    else:
+        _awaited_cleanup_tasks.pop(tracked, None)
+
+
+def _active_cleanup_frames() -> tuple[_CleanupFrame, ...]:
+    frames = _cleanup_frames.get()
+    current = asyncio.current_task()
+    if current is not None:
+        frames += tuple(_awaited_cleanup_tasks.get(current, ()))
+    return tuple(frame for frame in frames if frame.active)
+
+
+def active_effect_scopes() -> tuple[ActivationScope, ...]:
+    """Scope owners of live managed tasks and running cleanup callbacks."""
+    scopes = list(active_managed_scopes())
+    for frame in _active_cleanup_frames():
+        if (scope := frame.scope()) is not None:
+            scopes.append(scope)
+    return tuple(scopes)
 
 
 def _coroutine_has_task(
@@ -169,9 +255,10 @@ class _Pending:
 class _Effect:
     """一项 cleanup。Handle 关闭它时使用独立任务，不挂在调用方协程上。"""
 
-    def __init__(self, cleanup: Cleanup, label: str | None) -> None:
+    def __init__(self, cleanup: Cleanup, label: str | None, owner: ActivationScope) -> None:
         self.label = label
         self._cleanup = cleanup
+        self._owner = ref(owner)
         self._task: asyncio.Task[None] | None = None
         self.finished = False
         self._error: BaseException | None = None
@@ -183,16 +270,34 @@ class _Effect:
         return self._task
 
     async def _run(self) -> None:
+        with self._calling() as frame:
+            result: object = None
+            try:
+                result = self._cleanup()
+                if isawaitable(result):
+                    _track_cleanup_task(result, frame)
+                    await result
+            except asyncio.CancelledError as exc:
+                self._error = exc
+            except Exception as exc:  # noqa: BLE001 - 先保存，等关闭方真正观察到再报告
+                self._error = exc
+            finally:
+                _untrack_cleanup_task(result, frame)
+                self.finished = True
+
+    @contextmanager
+    def _calling(self) -> Iterator[_CleanupFrame | None]:
+        owner = self._owner()
+        if owner is None:
+            yield None
+            return
+        frame = _CleanupFrame(ref(owner), ref(self))
+        token = _cleanup_frames.set((*_cleanup_frames.get(), frame))
         try:
-            result = self._cleanup()
-            if isawaitable(result):
-                await result
-        except asyncio.CancelledError as exc:
-            self._error = exc
-        except Exception as exc:  # noqa: BLE001 - 先保存，等关闭方真正观察到再报告
-            self._error = exc
+            yield frame
         finally:
-            self.finished = True
+            frame.active = False
+            _cleanup_frames.reset(token)
 
     def _claim(self) -> BaseException | None:
         """一次正常观察取走异常。调用方取消发生在进入这里之前，不会消费它。"""
@@ -215,31 +320,50 @@ class _Effect:
             return _Pending(self._join)
         if self.finished:
             return self._claim()
+        owner = self._owner()
+        frame = _CleanupFrame(ref(owner), ref(self)) if owner is not None else None
+        token = _cleanup_frames.set((*_cleanup_frames.get(), frame)) if frame is not None else None
         try:
             result = self._cleanup()
         except asyncio.CancelledError as exc:
+            if frame is not None:
+                frame.active = False
             self._error = exc
             self.finished = True
             return self._claim()
         except Exception as exc:  # noqa: BLE001 - 汇总后继续其余项
+            if frame is not None:
+                frame.active = False
             self._error = exc
             self.finished = True
             return self._claim()
+        finally:
+            if token is not None:
+                _cleanup_frames.reset(token)
         if isawaitable(result):
-            self._task = asyncio.get_running_loop().create_task(self._await_started(result))
+            _track_cleanup_task(result, frame)
+            self._task = asyncio.get_running_loop().create_task(self._await_started(result, frame))
             return _Pending(self._join)
+        if frame is not None:
+            frame.active = False
         self.finished = True
         return self._claim()
 
-    async def _await_started(self, result: Awaitable[object]) -> None:
-        try:
-            await result
-        except asyncio.CancelledError as exc:
-            self._error = exc
-        except Exception as exc:  # noqa: BLE001 - 先保存，等关闭方真正观察到再报告
-            self._error = exc
-        finally:
-            self.finished = True
+    async def _await_started(
+        self, result: Awaitable[object], frame: _CleanupFrame | None = None
+    ) -> None:
+        with self._calling():
+            try:
+                await result
+            except asyncio.CancelledError as exc:
+                self._error = exc
+            except Exception as exc:  # noqa: BLE001 - 先保存，等关闭方真正观察到再报告
+                self._error = exc
+            finally:
+                if frame is not None:
+                    frame.active = False
+                _untrack_cleanup_task(result, frame)
+                self.finished = True
 
     async def _join(self) -> BaseException | None:
         task = self._task
@@ -267,7 +391,7 @@ class _ManagedTask:
     """受管任务。取消只发送一次；完成后保留待报告的异常并移除可释放项。"""
 
     def __init__(
-        self, task: asyncio.Task[object], label: str | None, owner: "ActivationScope"
+        self, task: asyncio.Task[object], label: str | None, owner: ActivationScope
     ) -> None:
         self.label = label
         self._task = task
@@ -341,7 +465,7 @@ class _ManagedTask:
 class _ChildLink:
     """父栈上的子 Scope。关闭时进入子树自己的那一次事务。"""
 
-    def __init__(self, child: "ActivationScope") -> None:
+    def __init__(self, child: ActivationScope) -> None:
         self.child = child
 
     def poll(self, cause: BaseException | None) -> _Outcome | _Pending:
@@ -378,7 +502,7 @@ class ActivationScope:
         instance_id: str | None = None,
         *,
         label: str | None = None,
-        parent: "ActivationScope | None" = None,
+        parent: ActivationScope | None = None,
     ) -> None:
         self._plugin_id = plugin_id
         self._instance_id = instance_id
@@ -401,9 +525,9 @@ class ActivationScope:
     def state(self) -> EffectScopeState:
         return self._state
 
-    def defer(self, cleanup: Cleanup, label: str | None = None) -> "EffectHandle":
+    def defer(self, cleanup: Cleanup, label: str | None = None) -> EffectHandle:
         self._reject_if_closed()
-        effect = _Effect(cleanup, label)
+        effect = _Effect(cleanup, label, self)
         self._effects[effect] = None
         return EffectHandle(effect)
 
@@ -423,7 +547,7 @@ class ActivationScope:
             raise
         return value
 
-    def child_scope(self, *, label: str | None = None) -> "ActivationScope":
+    def child_scope(self, *, label: str | None = None) -> ActivationScope:
         self._reject_if_closed()
         child = ActivationScope(
             self._plugin_id,
@@ -439,14 +563,19 @@ class ActivationScope:
         coroutine: Coroutine[object, object, T],
         *,
         label: str | None = None,
-    ) -> "TaskHandle[T]":
+    ) -> TaskHandle[T]:
         prepared: Coroutine[object, object, T] = self._prepare_coroutine(coroutine)
+        frame = _TaskFrame(ref(self))
+        token = _task_frames.set((*_task_frames.get(), frame))
         try:
             task = asyncio.get_running_loop().create_task(prepared)
         except Exception:
             # 创建失败后没有 Scope 接管这个新协程，避免产生未等待协程警告。
             prepared.close()
             raise
+        finally:
+            _task_frames.reset(token)
+        frame.task = ref(cast(asyncio.Task[object], task))
         item = _ManagedTask(cast(asyncio.Task[object], task), label, self)
         self._effects[item] = None
         return TaskHandle(item)
@@ -502,10 +631,26 @@ class ActivationScope:
 
     async def close(self, cause: BaseException | None = None) -> tuple[BaseException, ...]:
         """按后进先出清理。并发调用等待同一个事务，单项失败不阻止其余项。"""
+        self._reject_self_join()
         errors, cancel = await self._finish(cause)
         if cancel is not None:
             raise cancel
         return errors
+
+    def _reject_self_join(self) -> None:
+        """A managed task cannot await closure of a scope which owns it."""
+        for owner in active_effect_scopes():
+            scope: ActivationScope | None = owner
+            while scope is not None:
+                if scope is self:
+                    raise PluginActivationError(
+                        "a managed task cannot close its owning scope",
+                        plugin_id=self._plugin_id,
+                        instance_id=self._instance_id,
+                        phase="effects",
+                        source="activation-scope",
+                    )
+                scope = scope._parent
 
     async def _finish(
         self,
@@ -662,6 +807,14 @@ class EffectHandle:
 
     async def aclose(self) -> None:
         """提前执行一次 cleanup；普通异常只由首次领取者抛出。"""
+        if any(frame.effect() is self._effect for frame in _active_cleanup_frames()):
+            raise PluginActivationError(
+                "a cleanup cannot close its own handle",
+                plugin_id=None,
+                instance_id=None,
+                phase="effects",
+                source="activation-scope",
+            )
         error = await self._effect.wait_for_handle()
         if error is not None:
             raise error
@@ -688,6 +841,17 @@ class TaskHandle(Generic[T]):
 
     async def aclose(self) -> None:
         """取消并等待任务；普通异常由首次领取者原样抛出。"""
+        if any(
+            frame.live() and frame.task is not None and frame.task() is self._item.task
+            for frame in _task_frames.get()
+        ):
+            raise PluginActivationError(
+                "a managed task cannot close its own handle",
+                plugin_id=None,
+                instance_id=None,
+                phase="effects",
+                source="activation-scope",
+            )
         error = await self._item.wait_for_handle()
         if error is not None:
             raise error
@@ -740,8 +904,8 @@ class PluginContext:
         scope: ActivationScope,
         services: ServiceFacade,
         capabilities: Iterable[str] = (),
-        events: "EventFacade | None" = None,
-        extensions: "ExtensionFacade | None" = None,
+        events: EventFacade | None = None,
+        extensions: ExtensionFacade | None = None,
     ) -> None:
         self.plugin_id = plugin_id
         self.instance_id = instance_id
@@ -758,14 +922,14 @@ class PluginContext:
         return self._capabilities
 
     @property
-    def events(self) -> "EventFacade":
+    def events(self) -> EventFacade:
         """与本次 Activation 绑定的事件访问门面。"""
         if self._events is None:
             raise RuntimeError("event facade is not attached to a host")
         return self._events
 
     @property
-    def extensions(self) -> "ExtensionFacade":
+    def extensions(self) -> ExtensionFacade:
         """与本次 Activation 绑定的观察型扩展访问门面。"""
         if self._extensions is None:
             raise RuntimeError("extension facade is not attached to a host")

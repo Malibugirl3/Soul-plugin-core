@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
-from collections.abc import Awaitable, Callable
+import weakref
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -19,6 +22,18 @@ if TYPE_CHECKING:
     from soul_plugin_core.context import ActivationScope, EffectHandle
 
 EventHandler = Callable[[object], Awaitable[object]]
+
+
+@dataclass
+class _CallFrame:
+    registry: weakref.ReferenceType[EventRegistry]
+    instance_id: str
+    active: bool = True
+
+
+_call_frames: contextvars.ContextVar[tuple[_CallFrame, ...]] = contextvars.ContextVar(
+    "soul_plugin_core_event_calls", default=()
+)
 
 
 @dataclass(eq=False)
@@ -63,6 +78,26 @@ class EventRegistry:
         self._topics: dict[str, dict[int, _Subscription]] = {}
         self._snapshots: dict[str, tuple[_Subscription, ...]] = {}
         self._next_number = 0
+
+    def active_instance_ids(self) -> frozenset[str]:
+        """当前事件调用链中仍在途的发布者及监听者。"""
+        return frozenset(
+            frame.instance_id
+            for frame in _call_frames.get()
+            if frame.active and frame.registry() is self
+        )
+
+    @contextmanager
+    def _calling(self, owner: _Activation) -> Iterator[None]:
+        owner.enter()
+        frame = _CallFrame(weakref.ref(self), owner.instance_id)
+        token = _call_frames.set((*_call_frames.get(), frame))
+        try:
+            yield
+        finally:
+            frame.active = False
+            _call_frames.reset(token)
+            owner.leave()
 
     def open_activation(
         self,
@@ -153,16 +188,14 @@ class EventRegistry:
             owner = subscription.owner
             if not subscription.active or owner.state != "active":
                 continue
-            owner.enter()
-            try:
-                result = subscription.handler(payload)
-                if not inspect.isawaitable(result):
-                    raise TypeError("event listener must return an awaitable")
-                await result
-            except Exception as exc:  # noqa: BLE001 - 单项失败不阻止其余监听器
-                failures.append(EventListenerFailure(owner.plugin_id, owner.instance_id, exc))
-            finally:
-                owner.leave()
+            with self._calling(owner):
+                try:
+                    result = subscription.handler(payload)
+                    if not inspect.isawaitable(result):
+                        raise TypeError("event listener must return an awaitable")
+                    await result
+                except Exception as exc:  # noqa: BLE001 - 单项失败不阻止其余监听器
+                    failures.append(EventListenerFailure(owner.plugin_id, owner.instance_id, exc))
         if failures:
             raise EventDispatchError(
                 event=name,
@@ -192,11 +225,8 @@ class EventFacade:
         """按顺序等待监听器；普通监听器错误汇总为 EventDispatchError。"""
         self._ensure_open("events.publish")
         _check_name(name)
-        self._owner.enter()
-        try:
+        with self._registry._calling(self._owner):
             await self._registry._publish(self._owner, name, payload)
-        finally:
-            self._owner.leave()
 
     def _ensure_open(self, capability: str) -> None:
         owner = self._owner

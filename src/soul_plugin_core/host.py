@@ -1,22 +1,58 @@
 """宿主：按实例计划激活，并在 start 成功后提交该实例暂存的服务。"""
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 
 from soul_plugin_core.capabilities import CapabilityPolicy
 from soul_plugin_core.config import validate_deployment
-from soul_plugin_core.context import ActivationScope, PluginContext
+from soul_plugin_core.context import ActivationScope, PluginContext, active_effect_scopes
 from soul_plugin_core.contracts import PluginDefinition
 from soul_plugin_core.dependency import ActivationPlan
 from soul_plugin_core.errors import PluginActivationError, PluginCleanupError, PluginLoadError
 from soul_plugin_core.events import EventRegistry
 from soul_plugin_core.extensions import ExtensionRegistry
-from soul_plugin_core.instances import InstanceDefinition, expand_instance_plan
+from soul_plugin_core.instances import (
+    InstanceActivationPlan,
+    InstanceDefinition,
+    expand_instance_plan,
+)
 from soul_plugin_core.lifecycle import Fiber, FiberState, load_plugin
 from soul_plugin_core.services import ServiceRegistry
 
 _StopOutcome = tuple[tuple[BaseException, ...], asyncio.CancelledError | None]
+
+
+@dataclass(frozen=True)
+class InstanceSnapshot:
+    """一次宿主诊断时读取的实例状态；不含配置或插件对象。
+
+    binding_blockers 表示当前不可用的已绑定 Provider；活动的 Optional
+    消费者也可能出现该项，并不表示它已被停止。
+    """
+
+    instance_id: str
+    plugin_id: str
+    state: FiberState
+    disabled: bool
+    blockers: tuple[str, ...]
+    binding_blockers: tuple[str, ...]
+
+
+@dataclass
+class _LifecycleFrame:
+    """A shared live marker prevents stale inherited task contexts from blocking later work."""
+
+    owner: object
+    active: bool = True
+
+
+_lifecycle_frames: ContextVar[tuple[_LifecycleFrame, ...]] = ContextVar(
+    "soul_plugin_core_lifecycle_frames", default=()
+)
 
 
 class PluginHost:
@@ -92,6 +128,86 @@ class PluginHost:
         self._events = EventRegistry()
         self._extensions = ExtensionRegistry()
         self._lock = asyncio.Lock()
+        self._lifecycle_owner = object()
+
+    @asynccontextmanager
+    async def _operation(self) -> AsyncIterator[None]:
+        """Reject lifecycle reentry before acquiring the non-reentrant lock."""
+        if any(
+            frame.owner is self._lifecycle_owner and frame.active
+            for frame in _lifecycle_frames.get()
+        ):
+            self._lifecycle_error("lifecycle operations cannot be awaited from lifecycle hooks")
+        # A concurrent shutdown may already hold the lock while waiting for this
+        # callback. Waiting for that lock inside the callback would deadlock.
+        if self._lock.locked() and self._active_callback_owners():
+            self._lifecycle_error(
+                "lifecycle operation cannot wait for a host draining this callback"
+            )
+        async with self._lock:
+            frame = _LifecycleFrame(self._lifecycle_owner)
+            token = _lifecycle_frames.set((*_lifecycle_frames.get(), frame))
+            try:
+                yield
+            finally:
+                frame.active = False
+                _lifecycle_frames.reset(token)
+
+    def _lifecycle_error(self, message: str, instance_id: str | None = None) -> None:
+        fiber = self._fibers.get(instance_id) if instance_id is not None else None
+        raise PluginActivationError(
+            message,
+            plugin_id=fiber.plugin_id if fiber is not None else None,
+            instance_id=instance_id,
+            phase="lifecycle",
+            source=fiber.source if fiber is not None else str(self._config_path),
+        )
+
+    def _ensure_no_self_drain(self, selected: set[str]) -> None:
+        conflicts = self._active_callback_owners().intersection(selected)
+        if conflicts:
+            instance_id = min(conflicts)
+            self._lifecycle_error(
+                "cannot stop an instance from its active service call or event callback or effect",
+                instance_id,
+            )
+
+    def _active_callback_owners(self) -> frozenset[str]:
+        roots: set[ActivationScope] = set()
+        for scope in active_effect_scopes():
+            while scope._parent is not None:
+                scope = scope._parent
+            roots.add(scope)
+        effect_owners = (
+            {instance_id for instance_id, fiber in self._fibers.items() if fiber.scope in roots}
+            if roots
+            else set()
+        )
+        return (
+            self._services.active_provider_ids()
+            | self._events.active_instance_ids()
+            | self._extensions.active_instance_ids()
+            | effect_owners
+        )
+
+    @property
+    def instance_plan(self) -> InstanceActivationPlan:
+        """返回不可变的实例级部署计划，不读取配置或导入插件。"""
+        return self._instance_plan
+
+    def snapshot(self) -> tuple[InstanceSnapshot, ...]:
+        """按计划顺序返回瞬时状态；同一事件循环内同步采集，不提供跨线程保证。"""
+        return tuple(
+            InstanceSnapshot(
+                instance_id=instance_id,
+                plugin_id=self._plugin_ids[instance_id],
+                state=self._fibers[instance_id].state,
+                disabled=instance_id in self._disabled,
+                blockers=self.get_blockers(instance_id),
+                binding_blockers=self.get_binding_blockers(instance_id),
+            )
+            for instance_id in self._instance_plan.order
+        )
 
     def get_state(self, instance_id: str) -> FiberState:
         """返回实例的当前状态；未知实例由映射抛出 KeyError。"""
@@ -126,17 +242,18 @@ class PluginHost:
         已绑定的可选消费者保持运行，其旧句柄失效且不会自动重绑。
         此操作不注销实例，也不检测外部服务故障。
         """
-        async with self._lock:
-            self._fibers[instance_id]  # 未知实例不改变宿主状态。
+        self._fibers[instance_id]  # 未知实例不改变宿主状态。
+        affected = {instance_id}
+        pending = [instance_id]
+        while pending:
+            for consumer in self._required_consumers[pending.pop()]:
+                if consumer not in affected:
+                    affected.add(consumer)
+                    pending.append(consumer)
+        self._ensure_no_self_drain(affected)
+        async with self._operation():
             self._ensure_not_disposed()
             self._disabled.add(instance_id)
-            affected = {instance_id}
-            pending = [instance_id]
-            while pending:
-                for consumer in self._required_consumers[pending.pop()]:
-                    if consumer not in affected:
-                        affected.add(consumer)
-                        pending.append(consumer)
             await self._stop_in_reverse(affected)
 
     async def activate_instance(self, instance_id: str) -> None:
@@ -145,7 +262,7 @@ class PluginHost:
         不自动恢复消费者；可随后调用 activate() 按原计划启动可用实例。
         失败时保留显式停用意图，FAILED 实例不会被自动重试。
         """
-        async with self._lock:
+        async with self._operation():
             fiber = self._fibers[instance_id]
             self._ensure_not_disposed()
             if fiber.state is FiberState.FAILED:
@@ -168,7 +285,7 @@ class PluginHost:
 
     async def activate(self) -> None:
         """按依赖顺序激活；失败或取消时逆序回滚本次新激活的实例。"""
-        async with self._lock:
+        async with self._operation():
             self._ensure_not_disposed()
             self._preflight()
             activated: list[Fiber] = []
@@ -241,12 +358,14 @@ class PluginHost:
 
     async def stop(self) -> None:
         """逆序停止活动实例并清理资源；成功停止的实例可再次激活。"""
-        async with self._lock:
+        self._ensure_no_self_drain(set(self._fibers))
+        async with self._operation():
             await self._stop_in_reverse()
 
     async def dispose(self) -> None:
         """停止实例并进入终态；清理失败仍进入终态并抛出清理错误。"""
-        async with self._lock:
+        self._ensure_no_self_drain(set(self._fibers))
+        async with self._operation():
             if all(fiber.state is FiberState.DISPOSED for fiber in self._fibers.values()):
                 return
             try:

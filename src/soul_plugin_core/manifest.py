@@ -1,6 +1,7 @@
 import re
 import sys
 from pathlib import Path
+from typing import Any, TypeGuard
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
@@ -24,7 +25,7 @@ _ENTRY_POINT = re.compile(
 )
 
 
-def load_manifest(path):
+def load_manifest(path: str | Path) -> PluginDefinition:
     """读取并验证 TOML Manifest；只生成定义，不导入插件入口。"""
     path = Path(path)
     source = str(path)
@@ -48,7 +49,7 @@ def load_manifest(path):
     )
 
 
-def _read_toml(path):
+def _read_toml(path: Path) -> dict[str, Any]:
     source = str(path)
     try:
         raw = path.read_bytes()
@@ -71,7 +72,7 @@ def _read_toml(path):
     return data
 
 
-def _parse_plugin(data, source):
+def _parse_plugin(data: dict[str, Any], source: str) -> tuple[str, str, str, str]:
     plugin = data.get("plugin")
     if not isinstance(plugin, dict):
         raise ManifestValidationError("plugin table is required", source=source, field="plugin")
@@ -100,7 +101,9 @@ def _parse_plugin(data, source):
     return plugin_id, version, api_version, entry_point
 
 
-def _parse_dependencies(data, source, plugin_id):
+def _parse_dependencies(
+    data: dict[str, Any], source: str, plugin_id: str
+) -> tuple[tuple[PluginDependency, ...], tuple[ServiceDependency, ...]]:
     raw = _optional_table(data, "dependencies", source, plugin_id)
     if raw is None:
         return (), ()
@@ -111,7 +114,9 @@ def _parse_dependencies(data, source, plugin_id):
     )
 
 
-def _parse_plugin_dependencies(items, source, plugin_id):
+def _parse_plugin_dependencies(
+    items: Any, source: str, plugin_id: str
+) -> tuple[PluginDependency, ...]:
     items = _require_array(items, source, "dependencies.plugins", plugin_id)
     seen = set()
     result = []
@@ -138,7 +143,9 @@ def _parse_plugin_dependencies(items, source, plugin_id):
     return tuple(result)
 
 
-def _parse_service_dependencies(items, source, plugin_id):
+def _parse_service_dependencies(
+    items: Any, source: str, plugin_id: str
+) -> tuple[ServiceDependency, ...]:
     items = _require_array(items, source, "dependencies.services", plugin_id)
     seen = set()
     result = []
@@ -165,7 +172,9 @@ def _parse_service_dependencies(items, source, plugin_id):
     return tuple(result)
 
 
-def _parse_provides(data, source, plugin_id):
+def _parse_provides(
+    data: dict[str, Any], source: str, plugin_id: str
+) -> tuple[ProvidedService, ...]:
     raw = _optional_table(data, "provides", source, plugin_id)
     if raw is None:
         return ()
@@ -195,7 +204,7 @@ def _parse_provides(data, source, plugin_id):
     return tuple(result)
 
 
-def _parse_capabilities(data, source, plugin_id):
+def _parse_capabilities(data: dict[str, Any], source: str, plugin_id: str) -> tuple[str, ...]:
     raw = _optional_table(data, "capabilities", source, plugin_id)
     if raw is None:
         return ()
@@ -224,7 +233,7 @@ def _parse_capabilities(data, source, plugin_id):
     return tuple(result)
 
 
-def _parse_schema(data, source, plugin_id):
+def _parse_schema(data: dict[str, Any], source: str, plugin_id: str) -> str | None:
     raw = _optional_table(data, "config", source, plugin_id)
     if raw is None:
         return None
@@ -262,7 +271,7 @@ def _parse_schema(data, source, plugin_id):
     return value
 
 
-def _require_manifest_version(data, source, plugin_id):
+def _require_manifest_version(data: dict[str, Any], source: str, plugin_id: str | None) -> None:
     if "manifest_version" not in data:
         raise ManifestValidationError(
             "missing field",
@@ -280,13 +289,15 @@ def _require_manifest_version(data, source, plugin_id):
         )
 
 
-def _optional_table(data, key, source, plugin_id):
+def _optional_table(
+    data: dict[str, Any], key: str, source: str, plugin_id: str | None
+) -> dict[str, Any] | None:
     if key not in data:
         return None
     return _require_table(data[key], source, key, plugin_id)
 
 
-def _require_table(value, source, field, plugin_id):
+def _require_table(value: Any, source: str, field: str, plugin_id: str | None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ManifestValidationError(
             "must be a table", source=source, field=field, plugin_id=plugin_id
@@ -294,7 +305,7 @@ def _require_table(value, source, field, plugin_id):
     return value
 
 
-def _require_array(value, source, field, plugin_id):
+def _require_array(value: Any, source: str, field: str, plugin_id: str | None) -> list[Any]:
     if not isinstance(value, list):
         raise ManifestValidationError(
             "must be an array", source=source, field=field, plugin_id=plugin_id
@@ -302,7 +313,9 @@ def _require_array(value, source, field, plugin_id):
     return value
 
 
-def _require_text(table, key, source, field, plugin_id):
+def _require_text(
+    table: dict[str, Any], key: str, source: str, field: str, plugin_id: str | None
+) -> str:
     if key not in table:
         raise ManifestValidationError(
             "missing field", source=source, field=field, plugin_id=plugin_id
@@ -318,7 +331,9 @@ def _require_text(table, key, source, field, plugin_id):
     return value
 
 
-def _require_version(table, key, source, field, plugin_id):
+def _require_version(
+    table: dict[str, Any], key: str, source: str, field: str, plugin_id: str | None
+) -> str:
     text = _require_text(table, key, source, field, plugin_id)
     try:
         Version(text)
@@ -333,7 +348,9 @@ def _require_version(table, key, source, field, plugin_id):
     return text
 
 
-def _require_specifier(table, key, source, field, plugin_id):
+def _require_specifier(
+    table: dict[str, Any], key: str, source: str, field: str, plugin_id: str | None
+) -> str:
     text = _require_text(table, key, source, field, plugin_id)
     try:
         specifier = SpecifierSet(text)
@@ -355,7 +372,9 @@ def _require_specifier(table, key, source, field, plugin_id):
     return text
 
 
-def _require_bool(table, key, source, field, plugin_id):
+def _require_bool(
+    table: dict[str, Any], key: str, source: str, field: str, plugin_id: str | None
+) -> bool:
     if key not in table:
         return False
     value = table[key]
@@ -366,7 +385,9 @@ def _require_bool(table, key, source, field, plugin_id):
     return value
 
 
-def _reject_unknown(mapping, allowed, source, prefix, plugin_id):
+def _reject_unknown(
+    mapping: dict[str, Any], allowed: set[str], source: str, prefix: str, plugin_id: str | None
+) -> None:
     for key in mapping:
         if key not in allowed:
             field = f"{prefix}.{key}" if prefix else key
@@ -375,7 +396,7 @@ def _reject_unknown(mapping, allowed, source, prefix, plugin_id):
             )
 
 
-def _peek_plugin_id(plugin):
+def _peek_plugin_id(plugin: Any) -> str | None:
     if not isinstance(plugin, dict):
         return None
     value = plugin.get("id")
@@ -384,5 +405,5 @@ def _peek_plugin_id(plugin):
     return None
 
 
-def _is_plain_text(value):
+def _is_plain_text(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and value == value.strip() and bool(value)

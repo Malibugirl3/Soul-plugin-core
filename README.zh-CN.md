@@ -96,6 +96,7 @@ if __name__ == "__main__":
 - `[dependencies]` 可以声明插件或服务依赖，`[provides]` 声明提供的服务。强依赖缺失、版本不匹配或成环会使计划失败；可选依赖缺失、版本不匹配或成环时会在计划中标记为未绑定。重复插件 ID、重复服务 Provider 和自依赖均报错。
 - 部署配置文件必须存在，配置表使用 `[plugins."实例 ID"]`。插件没有声明 `[config]` 中的 `schema` 时，只接受空配置。
 - Schema 是相对 Manifest 目录的 JSON 文件，使用 JSON Schema Draft 2020-12；解析后的真实路径必须位于该目录内。宿主在导入任何插件入口前校验全部实例配置和能力授权。校验成功的配置递归只读，列表会变成元组。
+- Schema 引用仅支持同一文档内的引用；对远程地址及其他文件的检索会被拒绝。配置错误的诊断不包含配置值。
 
 可参考 [服务提供者 Manifest](examples/m4_demo/manifests/clock/plugin.toml) 和 [服务消费者 Manifest](examples/m4_demo/manifests/reporter/plugin.toml)。
 
@@ -131,6 +132,12 @@ schema = "config.schema.json"
 `await host.deactivate(instance_id)` 显式停用实例，并按依赖逆序停止仍在运行的强依赖消费者；无关实例和共享 Provider 不受影响。所有声明和绑定都会保留。`await host.activate_instance(instance_id)` 在全部已绑定 Provider 均为 ACTIVE 时只恢复该实例；之后调用 `activate()` 可以启动满足条件的消费者，但不会自动恢复显式停用的实例。两种激活方式都预检全部声明实例，`FAILED` 实例不能通过此接口重试。
 
 可以通过 `is_disabled()` 查询显式停用意图，`get_blockers()` 查询未运行的强依赖，`get_binding_blockers()` 查询全部未运行的已绑定 Provider。已绑定的 Optional 消费者在 Provider 停用时继续运行，但旧服务句柄失效；Provider 恢复后仍需重启消费者才能获得新句柄。目前不支持注销实例或动态重绑。
+
+`host.instance_plan` 可检查不可变的实例计划；`host.snapshot()` 返回按计划顺序排列的不可变实例状态快照，包含状态、显式停用标记和 Provider 阻塞信息，不包含配置值或插件对象。它是同一事件循环内同步读取的瞬时快照，不承诺跨线程一致性；活动 Optional 消费者的 `binding_blockers` 可能非空，这不代表该消费者已经停止。
+
+不要在插件生命周期钩子中等待同一 Host 的生命周期操作，也不要在服务调用、事件或扩展回调中等待会排空当前调用的停用或关闭操作；Core 会拒绝检测到的重入，避免循环等待。活跃调用创建的子任务继承这个限制，调用结束后限制解除。需要触发关闭时，应让调用先返回，再由宿主外层发起操作。
+
+受管任务和资源清理也遵循相同限制。Core 无法识别所有通过外部 Task 或 Future 间接形成的等待链；例如，清理等待一个早已创建的任务，该任务又通过其他任务等待所属实例停用，仍可能死锁。关闭请求应交由不被该实例的清理过程等待的宿主外层任务执行。
 
 ## 服务、资源与事件
 
